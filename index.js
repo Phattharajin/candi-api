@@ -12,6 +12,7 @@ const app = express();
 const cors = require("cors");
 const fileUpload = require('express-fileupload');
 const router = express.Router();
+const util = require("util");
 //const pool = mysql.createPool()
 
 app.use(cors());
@@ -23,7 +24,7 @@ const db = mysql.createConnection({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME
+  database: process.env.DB_
 });
 db.connect(err => {
     if (err) {
@@ -67,116 +68,102 @@ app.get("/change_password", (req, res) => {
     res.sendFile(path.resolve(__dirname, 'public', 'change_password.html'));
 });
 
+const dbQuery = util.promisify(db.query).bind(db); // for async/await
+
+// Middleware
 app.use(express.json());
-app.use(
-    session({
-       secret: "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",
-        resave: false,
-        saveUninitialized: true,
-    })
-);
+app.use(session({
+    secret: process.env.GOOGLE_CLIENT_SECRET,
+    resave: false,
+    saveUninitialized: true,
+}));
 app.use(passport.initialize());
 app.use(passport.session());
 
-// Google OAuth Strategy
-passport.use(
-    new GoogleStrategy(
-        {
-            clientID: process.env.GOOGLE_CLIENT_ID,
-            clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-            callbackURL: process.env.GOOGLE_REDIRECT_URI,
-        },
-        (accessToken, refreshToken, profile, done) => {
-            const email = profile.emails[0].value;
+// Serialize/Deserialize
+passport.serializeUser((user, done) => done(null, user));
+passport.deserializeUser((user, done) => done(null, user));
 
-            // Accept only lamduan and mfu domains
+// Passport Strategy
+passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: process.env.GOOGLE_REDIRECT_URI,
+},
+    async (accessToken, refreshToken, profile, done) => {
+        try {
+            const email = profile.emails[0].value;
+            const name = profile.displayName;
+
             if (!email.endsWith("@lamduan.mfu.ac.th") && !email.endsWith("@mfu.ac.th")) {
-                return done(null, false, { message: "Only @lamduan.mfu.ac.th or @mfu.ac.th emails are allowed!" });
+                return done(null, false, { message: "Only @lamduan.mfu.ac.th or @mfu.ac.th emails are allowed" });
             }
 
-            let name, studentID = null, role = "user", major_id = null, school_id = null;
+            let studentID = null;
+            let major_id = null;
+            let school_id = null;
+            let role = "user";
 
             if (email.endsWith("@lamduan.mfu.ac.th")) {
                 studentID = email.split("@")[0];
-                name = profile.displayName;
+                const schoolCode = studentID.substring(3, 5);
 
-                const schoolCode = studentID.substring(3, 5); // 4th and 5th characters
-
-                // Query school_id from school_codes table
-                db.query("SELECT school_id FROM school_codes WHERE school_code = ?", [schoolCode], (err, schoolResults) => {
-                    if (err) return done(err);
-
-                    if (schoolResults.length > 0) {
-                        school_id = schoolResults[0].school_id;
-                    }
-
-                    // Continue with user check or insert
-                    handleUserCreation();
-                });
-            } else if (email.endsWith("@mfu.ac.th")) {
-                // Only set name, no studentID/school_id
-                name = email.split("@")[0];
-                handleUserCreation();
+                const schoolResult = await dbQuery("SELECT school_id FROM school_codes WHERE school_code = ?", [schoolCode]);
+                if (schoolResult.length > 0) {
+                    school_id = schoolResult[0].school_id;
+                }
             }
 
-            function handleUserCreation() {
-                db.query("SELECT * FROM users WHERE email = ?", [email], (err, results) => {
-                    if (err) return done(err);
-
-                    if (results.length > 0) {
-                        return done(null, results[0]); // User already exists
-                    } else {
-                        const newUser = {
-                            name,
-                            email,
-                            studentID,
-                            role,
-                            major_id,
-                            school_id,
-                        };
-
-                        db.query("INSERT INTO users SET ?", newUser, (err, insertResult) => {
-                            if (err) return done(err);
-                            newUser.id = insertResult.insertId;
-                            return done(null, newUser);
-                        });
-                    }
-                });
+            let user = await dbQuery("SELECT * FROM users WHERE email = ?", [email]);
+            if (user.length > 0) {
+                return done(null, user[0]);
             }
+
+            const newUser = {
+                name,
+                email,
+                studentID,
+                role,
+                major_id,
+                school_id,
+            };
+
+            const insertResult = await dbQuery("INSERT INTO users SET ?", newUser);
+            newUser.id = insertResult.insertId;
+
+            done(null, newUser);
+        } catch (err) {
+            done(err);
         }
-    )
-);
-app.get(
-    "/auth/google/callback",
-    passport.authenticate("google", { failureRedirect: "/login?error=invalid_email" }),
-    (req, res) => {
-        db.query("SELECT role FROM users WHERE email = ?", [req.user.email], (err, results) => {
-            if (err) return res.redirect("/login?error=db_error");
+    }
+));
 
-            if (results.length === 0) {
+// Routes
+app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
+
+app.get("/auth/google/callback",
+    passport.authenticate("google", {
+        failureRedirect: "/login?error=invalid_email",
+        session: true
+    }),
+    async (req, res) => {
+        try {
+            const result = await dbQuery("SELECT role FROM users WHERE email = ?", [req.user.email]);
+
+            if (result.length === 0) {
                 return res.redirect("/login?error=user_not_found");
             }
 
-            const userRole = results[0].role;
-            let redirectUrl = "/home";
+            const userRole = result[0].role;
+            const redirectUrl = "/home"; // Could use `/admin` or `/committee` if needed
 
-            res.redirect(`${redirectUrl}?user=${encodeURIComponent(req.user.displayName)}`);
-        });
+            res.redirect(`${redirectUrl}?user=${encodeURIComponent(req.user.name || req.user.email)}`);
+        } catch (err) {
+            res.redirect("/login?error=db_error");
+        }
     }
 );
 
-// Serialize and Deserialize User
-passport.serializeUser((user, done) => {
-    done(null, user);
-});
-passport.deserializeUser((user, done) => {
-    done(null, user);
-});
-
-// Google OAuth Login
-app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
-
-// Logout Route
 app.get("/logout", (req, res) => {
     req.logout(() => {
         res.redirect("/login");
